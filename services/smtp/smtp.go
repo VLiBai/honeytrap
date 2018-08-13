@@ -34,6 +34,8 @@ import (
 	"context"
 	"net"
 
+	"time"
+
 	"github.com/honeytrap/honeytrap/event"
 	"github.com/honeytrap/honeytrap/pushers"
 	"github.com/honeytrap/honeytrap/services"
@@ -108,6 +110,7 @@ func (s *Service) SetChannel(c pushers.Channel) {
 }
 
 func (s *Service) Handle(ctx context.Context, conn net.Conn) error {
+	defer conn.Close()
 
 	rcvLine := make(chan string)
 
@@ -115,17 +118,19 @@ func (s *Service) Handle(ctx context.Context, conn net.Conn) error {
 	go func() {
 		for {
 			select {
+			case <-time.After(time.Minute * 2):
+				log.Error("timeout expired")
+				return
 			case message := <-s.receiveChan:
-				log.Debug("Message Received")
 				s.ch.Send(event.New(
 					services.EventOptions,
 					event.Category("smtp"),
 					event.Type("email"),
 					event.SourceAddr(conn.RemoteAddr()),
 					event.DestinationAddr(conn.LocalAddr()),
-					event.Custom("smtp.From", message.From),
-					event.Custom("smtp.To", message.To),
-					event.Custom("smtp.Body", message.Body.String()),
+					event.Custom("smtp.from", message.From),
+					event.Custom("smtp.to", message.To),
+					event.Custom("smtp.body", message.Body.String()),
 				))
 			case line := <-rcvLine:
 				s.ch.Send(event.New(
@@ -134,7 +139,7 @@ func (s *Service) Handle(ctx context.Context, conn net.Conn) error {
 					event.Type("input"),
 					event.SourceAddr(conn.RemoteAddr()),
 					event.DestinationAddr(conn.LocalAddr()),
-					event.Custom("smtp.Line", line),
+					event.Custom("smtp.line", line),
 				))
 			}
 		}

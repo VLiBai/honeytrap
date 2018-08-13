@@ -34,7 +34,6 @@ package canary
 
 import (
 	"bufio"
-	"bytes"
 	"context"
 	"fmt"
 	"io"
@@ -62,6 +61,11 @@ var log = logging.MustGetLogger("listeners/raw")
 
 var (
 	_ = listener.Register("raw", New)
+)
+
+var (
+	// EventCategoryARP
+	EventCategoryARP = event.Category("arp")
 )
 
 // first dns
@@ -220,6 +224,7 @@ func (c *Canary) handleUDP(eh *ethernet.Frame, iph *ipv4.Header, data []byte) er
 				SensorCanary,
 				EventCategoryUDP,
 
+				event.Protocol("udp"),
 				event.SourceHardwareAddr(eh.Source),
 				event.DestinationHardwareAddr(eh.Destination),
 
@@ -270,25 +275,27 @@ func (c *Canary) handleARP(data []byte) error {
 		return err
 	}
 
-	_ = arp
-
-	// check if it is my hardware address or broadcast
-	if bytes.Compare(arp.TargetMAC[:], []byte{0x00, 0x00, 0x00, 0x00, 0x00, 0x00}) == 0 {
-		if arp.Opcode == 0x01 {
-			// fmt.Printf("ARP: Who has %s? tell %s.", net.IPv4(arp.TargetIP[0], arp.TargetIP[1], arp.TargetIP[2], arp.TargetIP[3]).String(), net.IPv4(arp.SenderIP[0], arp.SenderIP[1], arp.SenderIP[2], arp.SenderIP[3]).String())
-		}
-		return nil
-	}
-
-	for _, networkInterface := range c.networkInterfaces {
-		if bytes.Equal(arp.TargetMAC[:], networkInterface.HardwareAddr) {
-			if arp.Opcode == 0x01 {
-				// fmt.Printf("ARP: Who has %s? tell %s.", net.IPv4(arp.TargetIP[0], arp.TargetIP[1], arp.TargetIP[2], arp.TargetIP[3]).String(), net.IPv4(arp.SenderIP[0], arp.SenderIP[1], arp.SenderIP[2], arp.SenderIP[3]).String())
-			}
-		} else {
-			// 			fmt.Println("ARP: not for me")
-		}
-	}
+	c.events.Send(event.New(
+		CanaryOptions,
+		EventCategoryARP,
+		event.DestinationHardwareAddr(arp.TargetMAC),
+		event.SourceIP(arp.SenderIP),
+		event.DestinationIP(arp.TargetIP),
+		event.SourceHardwareAddr(arp.SenderMAC),
+		event.DestinationHardwareAddr(arp.TargetMAC),
+		event.SourceIP(arp.SenderIP),
+		event.DestinationIP(arp.TargetIP),
+		event.Custom("arp-sender-hardware-address", arp.SenderHardwareAddress),
+		event.Custom("arp-target-hardware-address", arp.TargetHardwareAddress),
+		event.Custom("arp-sender-protocol-address", arp.SenderProtocolAddress),
+		event.Custom("arp-target-protocol-address", arp.TargetProtocolAddress),
+		event.Custom("arp-opcode", arp.Opcode),
+		event.Custom("arp-hardware-type", arp.HardwareType),
+		event.Custom("arp-hardware-size", arp.HardwareSize),
+		event.Custom("arp-protocol-type", arp.ProtocolType),
+		event.Custom("arp-protocol-size", arp.ProtocolSize),
+		event.Payload(data),
+	))
 
 	return nil
 }
@@ -357,6 +364,8 @@ func (c *Canary) handleTCP(eh *ethernet.Frame, iph *ipv4.Header, data []byte) er
 	// in race conditions (eg from socket) and from handleTCP function
 	state.m.Lock()
 	defer state.m.Unlock()
+
+	state.t = time.Now()
 
 	// https://tools.ietf.org/html/rfc793
 	// page 65
@@ -522,6 +531,7 @@ func (c *Canary) handleTCP(eh *ethernet.Frame, iph *ipv4.Header, data []byte) er
 					CanaryOptions,
 					EventCategoryTCP,
 					event.ServiceStarted,
+					event.Protocol("tcp"),
 					event.SourceHardwareAddr(eh.Source),
 					event.DestinationHardwareAddr(eh.Destination),
 					event.SourceIP(state.SrcIP),
@@ -1056,14 +1066,16 @@ func (c *Canary) Start(ctx context.Context) error {
 						// no packets received
 					} else if eh, err := ethernet.Parse(buffer[:n]); err != nil {
 					} else if eh.Type == EthernetTypeARP {
-						c.handleARP(eh.Payload[:])
+						data := make([]byte, len(eh.Payload))
+						copy(data, eh.Payload[:])
+						c.handleARP(data)
 					} else if eh.Type == EthernetTypeIPv4 {
 						if iph, err := ipv4.Parse(eh.Payload[:]); err != nil {
 							log.Debugf("Error parsing ip header: %s", err.Error())
 						} else {
-							data := iph.Payload[:]
+							data := make([]byte, len(iph.Payload))
+							copy(data, iph.Payload[:])
 
-							// eh.Source, eh.Destination
 							switch iph.Protocol {
 							case 1 /* icmp */ :
 								c.handleICMP(eh, iph, data)

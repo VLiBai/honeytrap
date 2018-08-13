@@ -42,7 +42,6 @@ import (
 
 	"github.com/mattn/go-isatty"
 
-	"github.com/BurntSushi/toml"
 	"github.com/fatih/color"
 
 	"github.com/honeytrap/honeytrap/cmd"
@@ -60,18 +59,22 @@ import (
 
 	"github.com/honeytrap/honeytrap/services"
 	_ "github.com/honeytrap/honeytrap/services/elasticsearch"
+	_ "github.com/honeytrap/honeytrap/services/eos"
 	_ "github.com/honeytrap/honeytrap/services/ethereum"
 	_ "github.com/honeytrap/honeytrap/services/ftp"
 	_ "github.com/honeytrap/honeytrap/services/ipp"
+	_ "github.com/honeytrap/honeytrap/services/ldap"
 	_ "github.com/honeytrap/honeytrap/services/redis"
 	_ "github.com/honeytrap/honeytrap/services/smtp"
 	_ "github.com/honeytrap/honeytrap/services/ssh"
+	_ "github.com/honeytrap/honeytrap/services/telnet"
 	_ "github.com/honeytrap/honeytrap/services/vnc"
 
 	"github.com/honeytrap/honeytrap/listener"
 	_ "github.com/honeytrap/honeytrap/listener/agent"
 	_ "github.com/honeytrap/honeytrap/listener/canary"
 	_ "github.com/honeytrap/honeytrap/listener/netstack"
+	_ "github.com/honeytrap/honeytrap/listener/netstack-experimental"
 	_ "github.com/honeytrap/honeytrap/listener/socket"
 	_ "github.com/honeytrap/honeytrap/listener/tap"
 	_ "github.com/honeytrap/honeytrap/listener/tun"
@@ -82,10 +85,12 @@ import (
 	"github.com/honeytrap/honeytrap/server/profiler"
 
 	_ "github.com/honeytrap/honeytrap/pushers/console"
+	_ "github.com/honeytrap/honeytrap/pushers/dshield"
 	_ "github.com/honeytrap/honeytrap/pushers/elasticsearch"
 	_ "github.com/honeytrap/honeytrap/pushers/file"
 	_ "github.com/honeytrap/honeytrap/pushers/kafka"
 	_ "github.com/honeytrap/honeytrap/pushers/marija"
+	_ "github.com/honeytrap/honeytrap/pushers/pulsar"
 	_ "github.com/honeytrap/honeytrap/pushers/rabbitmq"
 	_ "github.com/honeytrap/honeytrap/pushers/raven"
 	_ "github.com/honeytrap/honeytrap/pushers/slack"
@@ -167,6 +172,10 @@ type ServiceMap struct {
 	Type string
 }
 
+var (
+	ErrNoServicesGivenPort = fmt.Errorf("no services for the given ports")
+)
+
 /* Finds a service that can handle the given connection.
  * The service is picked (among those configured for the given port) as follows:
  *
@@ -187,14 +196,14 @@ func (hc *Honeytrap) findService(conn net.Conn) (*ServiceMap, net.Conn, error) {
 		port = a.Port
 		tmp, ok := hc.tcpPorts[port]
 		if !ok {
-			return nil, nil, fmt.Errorf("no services for the given port")
+			return nil, nil, ErrNoServicesGivenPort
 		}
 		serviceCandidates = tmp // prevent variable shadowing and "unused variable" error
 	case *net.UDPAddr:
 		port = a.Port
 		tmp, ok := hc.udpPorts[port]
 		if !ok {
-			return nil, nil, fmt.Errorf("no services for the given port")
+			return nil, nil, ErrNoServicesGivenPort
 		}
 		serviceCandidates = tmp
 	default:
@@ -266,11 +275,11 @@ func ToAddr(input string) (net.Addr, string, int, error) {
 
 	proto := parts[0]
 	portStr := parts[1]
-	portInt16, err := strconv.ParseInt(portStr, 10, 16)
+	portUint16, err := strconv.ParseUint(portStr, 10, 16)
 	if err != nil {
 		return nil, "", 0, fmt.Errorf("error parsing port value: %s", err.Error())
 	}
-	port := int(portInt16)
+	port := int(portUint16)
 	switch proto {
 	case "tcp":
 		addr, err := net.ResolveTCPAddr("tcp", ":"+portStr)
@@ -327,6 +336,7 @@ func (hc *Honeytrap) Run(ctx context.Context) {
 	w.Start()
 
 	channels := map[string]pushers.Channel{}
+	isChannelUsed := make(map[string]bool)
 	// sane defaults!
 
 	for key, s := range hc.config.Channels {
@@ -334,7 +344,7 @@ func (hc *Honeytrap) Run(ctx context.Context) {
 			Type string `toml:"type"`
 		}{}
 
-		err := toml.PrimitiveDecode(s, &x)
+		err := hc.config.PrimitiveDecode(s, &x)
 		if err != nil {
 			log.Error("Error parsing configuration of channel: %s", err.Error())
 			continue
@@ -353,6 +363,7 @@ func (hc *Honeytrap) Run(ctx context.Context) {
 			log.Fatalf("Error initializing channel %s(%s): %s", key, x.Type, err)
 		} else {
 			channels[key] = d
+			isChannelUsed[key] = false
 		}
 	}
 
@@ -363,7 +374,7 @@ func (hc *Honeytrap) Run(ctx context.Context) {
 			Categories []string `toml:"categories"`
 		}{}
 
-		err := toml.PrimitiveDecode(s, &x)
+		err := hc.config.PrimitiveDecode(s, &x)
 		if err != nil {
 			log.Error("Error parsing configuration of filter: %s", err.Error())
 			continue
@@ -376,6 +387,7 @@ func (hc *Honeytrap) Run(ctx context.Context) {
 				continue
 			}
 
+			isChannelUsed[name] = true
 			channel = pushers.TokenChannel(channel, hc.token)
 
 			if len(x.Categories) != 0 {
@@ -392,6 +404,12 @@ func (hc *Honeytrap) Run(ctx context.Context) {
 		}
 	}
 
+	for name, isUsed := range isChannelUsed {
+		if !isUsed {
+			log.Warningf("Channel %s is unused. Did you forget to add a filter?", name)
+		}
+	}
+
 	// initialize directors
 	directors := map[string]director.Director{}
 	availableDirectorNames := director.GetAvailableDirectorNames()
@@ -401,7 +419,7 @@ func (hc *Honeytrap) Run(ctx context.Context) {
 			Type string `toml:"type"`
 		}{}
 
-		err := toml.PrimitiveDecode(s, &x)
+		err := hc.config.PrimitiveDecode(s, &x)
 		if err != nil {
 			log.Error("Error parsing configuration of director: %s", err.Error())
 			continue
@@ -429,7 +447,7 @@ func (hc *Honeytrap) Run(ctx context.Context) {
 		Type string `toml:"type"`
 	}{}
 
-	if err := toml.PrimitiveDecode(hc.config.Listener, &x); err != nil {
+	if err := hc.config.PrimitiveDecode(hc.config.Listener, &x); err != nil {
 		log.Error("Error parsing configuration of listener: %s", err.Error())
 		return
 	}
@@ -453,7 +471,7 @@ func (hc *Honeytrap) Run(ctx context.Context) {
 			Port     string `toml:"port"`
 		}{}
 
-		if err := toml.PrimitiveDecode(s, &x); err != nil {
+		if err := hc.config.PrimitiveDecode(s, &x); err != nil {
 			log.Error("Error parsing configuration of service %s: %s", key, err.Error())
 			continue
 		}
@@ -466,7 +484,7 @@ func (hc *Honeytrap) Run(ctx context.Context) {
 		// individual configuration per service
 		options := []services.ServicerFunc{
 			services.WithChannel(hc.bus),
-			services.WithConfig(s),
+			services.WithConfig(s, hc.config),
 		}
 
 		if x.Director == "" {
@@ -516,7 +534,7 @@ func (hc *Honeytrap) Run(ctx context.Context) {
 			Services []string `toml:"services"`
 		}{}
 
-		if err := toml.PrimitiveDecode(s, &x); err != nil {
+		if err := hc.config.PrimitiveDecode(s, &x); err != nil {
 			log.Error("Error parsing configuration of generic ports: %s", err.Error())
 			continue
 		}
@@ -555,10 +573,15 @@ func (hc *Honeytrap) Run(ctx context.Context) {
 			for _, serviceName := range x.Services {
 				ptr, ok := serviceList[serviceName]
 				if !ok {
-					log.Error("Unknown service '%s' in ports", serviceName)
+					log.Error("Unknown service '%s' for port %s", serviceName, portStr)
+					continue
 				}
 				servicePtrs = append(servicePtrs, ptr)
 				isServiceUsed[serviceName] = true
+			}
+			if len(servicePtrs) == 0 {
+				log.Errorf("Port %s has no valid services, it won't be listened on", portStr)
+				continue
 			}
 			switch proto {
 			case "tcp":
@@ -593,6 +616,10 @@ func (hc *Honeytrap) Run(ctx context.Context) {
 		if !isUsed {
 			log.Warningf("Service %s is defined but not used", name)
 		}
+	}
+
+	if len(hc.config.Undecoded()) != 0 {
+		log.Warningf("Unrecognized keys in configuration: %v", hc.config.Undecoded())
 	}
 
 	if err := l.Start(ctx); err != nil {
